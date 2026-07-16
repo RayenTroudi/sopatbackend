@@ -1,0 +1,88 @@
+"""Handwritten text recognition using TrOCR.
+
+The model is loaded exactly once (at application startup) and kept in memory
+on app.state — never per request.
+"""
+
+import numpy as np
+import torch
+from PIL import Image
+
+from app.config import Settings
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class TrOCRService:
+    """Batched TrOCR inference, optimized for CPU."""
+
+    def __init__(self, settings: Settings) -> None:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+        logger.info("Loading TrOCR model '%s'...", settings.trocr_model_name)
+        self._device = torch.device(settings.device)
+        self._processor = TrOCRProcessor.from_pretrained(settings.trocr_model_name)
+        self._model = VisionEncoderDecoderModel.from_pretrained(settings.trocr_model_name)
+        self._model.to(self._device)
+        self._model.eval()
+        for param in self._model.parameters():
+            param.requires_grad_(False)
+
+        self._batch_size = settings.trocr_batch_size
+        self._max_new_tokens = settings.trocr_max_new_tokens
+        torch.set_num_threads(max(1, torch.get_num_threads()))
+        logger.info("TrOCR model ready on %s.", self._device)
+
+    def recognize(self, line_images: list[np.ndarray]) -> list[tuple[str, float]]:
+        """Recognize a list of cropped line images.
+
+        Returns one (text, confidence) tuple per input, in the same order.
+        Confidence is the exponential of the mean token log-probability.
+        """
+        results: list[tuple[str, float]] = []
+        for start in range(0, len(line_images), self._batch_size):
+            batch = line_images[start : start + self._batch_size]
+            results.extend(self._recognize_batch(batch))
+        return results
+
+    def _recognize_batch(self, batch: list[np.ndarray]) -> list[tuple[str, float]]:
+        pil_images = [Image.fromarray(img).convert("RGB") for img in batch]
+        inputs = self._processor(images=pil_images, return_tensors="pt")
+        pixel_values = inputs.pixel_values.to(self._device)
+
+        with torch.inference_mode():
+            output = self._model.generate(
+                pixel_values,
+                max_new_tokens=self._max_new_tokens,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+        texts = self._processor.batch_decode(output.sequences, skip_special_tokens=True)
+        confidences = self._sequence_confidences(output)
+        return [(text.strip(), conf) for text, conf in zip(texts, confidences)]
+
+    def _sequence_confidences(self, output) -> list[float]:
+        """Average per-token probability of the chosen tokens for each sequence."""
+        if not output.scores:
+            return [0.0] * output.sequences.shape[0]
+
+        # sequences includes the initial decoder_start token; scores align with
+        # the generated tokens that follow it.
+        generated = output.sequences[:, 1 : 1 + len(output.scores)]
+        confidences: list[float] = []
+        for i in range(generated.shape[0]):
+            token_probs: list[float] = []
+            for step, step_scores in enumerate(output.scores):
+                if step >= generated.shape[1]:
+                    break
+                token_id = generated[i, step]
+                if token_id == self._model.config.pad_token_id:
+                    continue
+                probs = torch.softmax(step_scores[i], dim=-1)
+                token_probs.append(float(probs[token_id]))
+            confidences.append(
+                round(float(np.mean(token_probs)), 4) if token_probs else 0.0
+            )
+        return confidences

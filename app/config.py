@@ -30,8 +30,15 @@ class Settings(BaseSettings):
 
     # Inference
     trocr_batch_size: int = 8
-    trocr_max_new_tokens: int = 128
+    trocr_max_new_tokens: int = 96
     detection_min_confidence: float = 0.5
+    # Dynamic int8 quantization of TrOCR linear layers. Benchmarked on this
+    # model: destroys recognition quality (degenerate token loops, garbage
+    # text) — keep OFF unless re-validated against a test set.
+    quantize_trocr: bool = False
+    # Per-region 180° angle classification. Off by default: the pipeline
+    # already deskews the whole image, so this step only costs time.
+    use_angle_cls: bool = False
 
     # Preprocessing
     max_image_dimension: int = 2500

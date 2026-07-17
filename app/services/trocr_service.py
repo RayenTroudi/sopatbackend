@@ -4,6 +4,8 @@ The model is loaded exactly once (at application startup) and kept in memory
 on app.state — never per request.
 """
 
+import os
+
 import numpy as np
 import torch
 from PIL import Image
@@ -22,17 +24,32 @@ class TrOCRService:
 
         logger.info("Loading TrOCR model '%s'...", settings.trocr_model_name)
         self._device = torch.device(settings.device)
-        self._processor = TrOCRProcessor.from_pretrained(settings.trocr_model_name)
+        self._processor = TrOCRProcessor.from_pretrained(
+            settings.trocr_model_name, use_fast=True
+        )
         self._model = VisionEncoderDecoderModel.from_pretrained(settings.trocr_model_name)
         self._model.to(self._device)
         self._model.eval()
         for param in self._model.parameters():
             param.requires_grad_(False)
 
+        if settings.quantize_trocr and self._device.type == "cpu":
+            logger.info("Applying dynamic int8 quantization to TrOCR...")
+            self._model = torch.quantization.quantize_dynamic(
+                self._model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+
         self._batch_size = settings.trocr_batch_size
         self._max_new_tokens = settings.trocr_max_new_tokens
-        torch.set_num_threads(max(1, torch.get_num_threads()))
-        logger.info("TrOCR model ready on %s.", self._device)
+        # Use every physical core; the previous set_num_threads(get_num_threads())
+        # call was a no-op.
+        torch.set_num_threads(max(1, os.cpu_count() or 1))
+        logger.info(
+            "TrOCR model ready on %s (%d torch threads, quantized=%s).",
+            self._device,
+            torch.get_num_threads(),
+            settings.quantize_trocr and self._device.type == "cpu",
+        )
 
     def recognize(self, line_images: list[np.ndarray]) -> list[tuple[str, float]]:
         """Recognize a list of cropped line images.
@@ -55,6 +72,7 @@ class TrOCRService:
             output = self._model.generate(
                 pixel_values,
                 max_new_tokens=self._max_new_tokens,
+                num_beams=1,  # greedy — guaranteed, regardless of the model's generation_config
                 output_scores=True,
                 return_dict_in_generate=True,
             )
@@ -64,25 +82,35 @@ class TrOCRService:
         return [(text.strip(), conf) for text, conf in zip(texts, confidences)]
 
     def _sequence_confidences(self, output) -> list[float]:
-        """Average per-token probability of the chosen tokens for each sequence."""
+        """Average per-token probability of the chosen tokens for each sequence.
+
+        Vectorized: one softmax + gather over the whole batch instead of a
+        Python loop with a full-vocab softmax per token.
+        """
         if not output.scores:
             return [0.0] * output.sequences.shape[0]
 
         # sequences includes the initial decoder_start token; scores align with
         # the generated tokens that follow it.
         generated = output.sequences[:, 1 : 1 + len(output.scores)]
+        # (batch, steps, vocab)
+        scores = torch.stack(list(output.scores), dim=1)
+        steps = min(generated.shape[1], scores.shape[1])
+        generated = generated[:, :steps]
+        scores = scores[:, :steps]
+
+        probs = torch.softmax(scores, dim=-1)
+        token_probs = probs.gather(-1, generated.unsqueeze(-1)).squeeze(-1)
+
+        pad_id = self._model.config.pad_token_id
+        mask = torch.ones_like(token_probs, dtype=torch.bool)
+        if pad_id is not None:
+            mask = generated != pad_id
+
         confidences: list[float] = []
-        for i in range(generated.shape[0]):
-            token_probs: list[float] = []
-            for step, step_scores in enumerate(output.scores):
-                if step >= generated.shape[1]:
-                    break
-                token_id = generated[i, step]
-                if token_id == self._model.config.pad_token_id:
-                    continue
-                probs = torch.softmax(step_scores[i], dim=-1)
-                token_probs.append(float(probs[token_id]))
+        for i in range(token_probs.shape[0]):
+            valid = token_probs[i][mask[i]]
             confidences.append(
-                round(float(np.mean(token_probs)), 4) if token_probs else 0.0
+                round(float(valid.mean()), 4) if valid.numel() else 0.0
             )
         return confidences

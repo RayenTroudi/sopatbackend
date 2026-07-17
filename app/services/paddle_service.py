@@ -29,20 +29,21 @@ class PaddleDetectionService:
         from paddleocr import PaddleOCR
 
         logger.info("Loading PaddleOCR detector (lang=%s)...", settings.paddle_lang)
+        self._use_angle_cls = settings.use_angle_cls
         self._ocr = PaddleOCR(
             lang=settings.paddle_lang,
-            use_angle_cls=True,
+            use_angle_cls=self._use_angle_cls,
             det=True,
             rec=False,
             show_log=False,
             use_gpu=settings.device != "cpu",
         )
-        logger.info("PaddleOCR detector ready.")
+        logger.info("PaddleOCR detector ready (angle_cls=%s).", self._use_angle_cls)
 
     def detect(self, image: np.ndarray) -> list[TextRegion]:
         """Return detected text regions sorted in natural reading order
         (top to bottom, then left to right within a line band)."""
-        result = self._ocr.ocr(image, rec=False, cls=True)
+        result = self._ocr.ocr(image, rec=False, cls=self._use_angle_cls)
         boxes = result[0] if result and result[0] is not None else []
 
         regions: list[TextRegion] = []

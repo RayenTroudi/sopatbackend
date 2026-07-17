@@ -27,11 +27,12 @@ RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<3.
 RUN useradd --create-home appuser
 ENV HF_HOME=/home/appuser/.cache/huggingface
 
-COPY --chown=appuser:appuser app ./app
 USER appuser
 
 # Pre-download models at build time (as appuser, separate layers) so
-# container startup is fast and the image works offline.
+# container startup is fast and the image works offline. These layers come
+# BEFORE the app code copy so code-only changes rebuild in seconds instead
+# of re-downloading ~1.5 GB of model weights.
 RUN python -c "\
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel; \
 TrOCRProcessor.from_pretrained('microsoft/trocr-base-handwritten'); \
@@ -41,6 +42,10 @@ RUN python -c "\
 from paddleocr import PaddleOCR; \
 PaddleOCR(lang='en', use_angle_cls=True, det=True, rec=False, show_log=False)"
 
+COPY --chown=appuser:appuser app ./app
+
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so ${PORT} expands — Railway (and most PaaS hosts) assign the
+# port dynamically via this env var instead of always using 8000.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

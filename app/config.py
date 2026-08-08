@@ -24,7 +24,13 @@ class Settings(BaseSettings):
     allowed_content_types: str = "image/jpeg,image/png,image/webp,image/bmp,image/tiff"
 
     # Models
-    trocr_model_name: str = "microsoft/trocr-base-handwritten"
+    # trocr-base-handwritten (334M params) peaked at ~1.5 GB during
+    # recognition and was OOM-killed by the 1 GB container on receipts with
+    # many lines. The small variant (62M) fits with headroom and is several
+    # times faster, at some cost in recognition accuracy. Set
+    # TROCR_MODEL_NAME to go back to base if the container gets more memory —
+    # the Dockerfile pre-downloads whichever model this names.
+    trocr_model_name: str = "microsoft/trocr-small-handwritten"
     paddle_lang: str = "en"
     device: str = "cpu"
 

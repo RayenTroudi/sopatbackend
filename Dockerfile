@@ -29,14 +29,23 @@ ENV HF_HOME=/home/appuser/.cache/huggingface
 
 USER appuser
 
+# Recognition model. The small variant replaced base because base peaked at
+# ~1.5 GB during recognition and was OOM-killed by the 1 GB container. Baked
+# in as ENV so the weights pre-downloaded below are the ones the app loads —
+# override at build time (--build-arg) and the runtime default follows.
+ARG TROCR_MODEL_NAME=microsoft/trocr-small-handwritten
+ENV TROCR_MODEL_NAME=${TROCR_MODEL_NAME}
+
 # Pre-download models at build time (as appuser, separate layers) so
 # container startup is fast and the image works offline. These layers come
 # BEFORE the app code copy so code-only changes rebuild in seconds instead
-# of re-downloading ~1.5 GB of model weights.
+# of re-downloading the model weights.
 RUN python -c "\
+import os; \
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel; \
-TrOCRProcessor.from_pretrained('microsoft/trocr-base-handwritten'); \
-VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-handwritten')"
+name = os.environ['TROCR_MODEL_NAME']; \
+TrOCRProcessor.from_pretrained(name); \
+VisionEncoderDecoderModel.from_pretrained(name)"
 
 RUN python -c "\
 from paddleocr import PaddleOCR; \

@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     trocr_batch_size: int = 4
     trocr_max_new_tokens: int = 96
     detection_min_confidence: float = 0.5
+    # Concurrent pipeline runs. Each in-flight request holds its own model
+    # activations, so two at once doubled peak memory and got the container
+    # OOM-killed. Recognition is CPU-bound on 2 vCPU, so running them in
+    # parallel bought no throughput anyway — queue instead of crashing.
+    ocr_max_concurrency: int = 1
+    # How long a queued request waits for its turn before giving up with 503,
+    # kept under the mobile client's 120s request timeout.
+    ocr_queue_timeout_s: float = 90.0
     # Dynamic int8 quantization of TrOCR linear layers. Benchmarked on this
     # model: destroys recognition quality (degenerate token loops, garbage
     # text) — keep OFF unless re-validated against a test set.

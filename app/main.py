@@ -6,6 +6,7 @@ they are never reloaded per request.
 
 from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,6 +34,10 @@ async def lifespan(app: FastAPI):
 
     app.state.settings = settings
     app.state.pipeline = OCRPipeline(detector, recognizer, settings)
+    # Bounds how many pipeline runs hold model activations at once; see
+    # Settings.ocr_max_concurrency. Created here so it binds to the running
+    # event loop.
+    app.state.ocr_semaphore = anyio.Semaphore(settings.ocr_max_concurrency)
     logger.info("Models loaded. Service is ready.")
 
     yield

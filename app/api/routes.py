@@ -62,6 +62,21 @@ async def ocr(request: Request, image: UploadFile = File(...)) -> JSONResponse:
 
     logger.info("[%s] OCR request: %s (%d bytes)", request_id, image.filename, len(data))
 
+    # Only settings.ocr_max_concurrency runs may hold model activations at
+    # once; the rest queue here rather than pushing the container into an OOM
+    # kill (which surfaced to the client as a bare 502).
+    semaphore = request.app.state.ocr_semaphore
+    try:
+        with anyio.fail_after(settings.ocr_queue_timeout_s):
+            await semaphore.acquire()
+    except TimeoutError:
+        logger.warning("[%s] Timed out waiting for an OCR slot.", request_id)
+        return _error(
+            503,
+            "Server busy processing other scans. Please retry in a moment.",
+            request_id,
+        )
+
     try:
         # The pipeline is CPU-bound; run it in a worker thread so the event
         # loop keeps serving other requests.
@@ -75,6 +90,8 @@ async def ocr(request: Request, image: UploadFile = File(...)) -> JSONResponse:
     except Exception:
         logger.exception("[%s] OCR pipeline failed.", request_id)
         return _error(500, "Internal server error during OCR processing.", request_id)
+    finally:
+        semaphore.release()
 
     processing_time = round(time.perf_counter() - start, 3)
     logger.info(

@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     device: str = "cpu"
 
     # Inference
-    trocr_batch_size: int = 8
+    # generate(output_scores=True) retains one (batch, steps, vocab) logits
+    # tensor for the whole batch; with a 50k vocab that is ~19 MB per image at
+    # 96 steps. 4 keeps the peak comfortable inside a 1 GB container.
+    trocr_batch_size: int = 4
     trocr_max_new_tokens: int = 96
     detection_min_confidence: float = 0.5
     # Dynamic int8 quantization of TrOCR linear layers. Benchmarked on this

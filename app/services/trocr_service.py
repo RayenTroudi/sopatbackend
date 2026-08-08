@@ -16,6 +16,50 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+CGROUP_V2_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+CGROUP_V1_CPU_QUOTA = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+CGROUP_V1_CPU_PERIOD = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+
+
+def _read_first_line(path: str) -> str:
+    with open(path) as handle:
+        return handle.readline().strip()
+
+
+def _available_cpus() -> int:
+    """Cores this process may actually use.
+
+    os.cpu_count() reports the host's cores, not the container's cgroup CPU
+    quota — on a shared PaaS host that is a wildly inflated number (48 on
+    Railway), and every torch thread carries its own workspace buffers. Read
+    the cgroup v2/v1 quota first and fall back to the affinity mask.
+
+    An unlimited quota ("max" on v2, -1 on v1) means no container limit, so
+    the affinity mask is the right answer there.
+    """
+    # v2: single line "<quota|max> <period>". v1: quota and period in
+    # separate files, quota -1 when unlimited.
+    for quota_path, period_path in (
+        (CGROUP_V2_CPU_MAX, None),
+        (CGROUP_V1_CPU_QUOTA, CGROUP_V1_CPU_PERIOD),
+    ):
+        try:
+            fields = _read_first_line(quota_path).split()
+            if fields[0] == "max":
+                break
+            period = fields[1] if period_path is None else _read_first_line(period_path)
+            cores = int(fields[0]) / int(period)
+            if cores > 0:
+                return max(1, int(cores))
+        except (OSError, ValueError, IndexError, ZeroDivisionError):
+            continue
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # not available on Windows/macOS
+        return max(1, os.cpu_count() or 1)
+
+
 class TrOCRService:
     """Batched TrOCR inference, optimized for CPU."""
 
@@ -41,9 +85,7 @@ class TrOCRService:
 
         self._batch_size = settings.trocr_batch_size
         self._max_new_tokens = settings.trocr_max_new_tokens
-        # Use every physical core; the previous set_num_threads(get_num_threads())
-        # call was a no-op.
-        torch.set_num_threads(max(1, os.cpu_count() or 1))
+        torch.set_num_threads(_available_cpus())
         logger.info(
             "TrOCR model ready on %s (%d torch threads, quantized=%s).",
             self._device,
@@ -84,8 +126,12 @@ class TrOCRService:
     def _sequence_confidences(self, output) -> list[float]:
         """Average per-token probability of the chosen tokens for each sequence.
 
-        Vectorized: one softmax + gather over the whole batch instead of a
-        Python loop with a full-vocab softmax per token.
+        Softmax and gather run one decoding step at a time. Stacking every
+        step into a single (batch, steps, vocab) tensor and softmaxing that
+        allocates two more copies of the full logits — with TrOCR's 50k vocab
+        that is hundreds of MB per request, which OOM-killed the container on
+        receipts with many lines. Per step the temporary is (batch, vocab) and
+        is freed on the next iteration.
         """
         if not output.scores:
             return [0.0] * output.sequences.shape[0]
@@ -93,24 +139,27 @@ class TrOCRService:
         # sequences includes the initial decoder_start token; scores align with
         # the generated tokens that follow it.
         generated = output.sequences[:, 1 : 1 + len(output.scores)]
-        # (batch, steps, vocab)
-        scores = torch.stack(list(output.scores), dim=1)
-        steps = min(generated.shape[1], scores.shape[1])
-        generated = generated[:, :steps]
-        scores = scores[:, :steps]
-
-        probs = torch.softmax(scores, dim=-1)
-        token_probs = probs.gather(-1, generated.unsqueeze(-1)).squeeze(-1)
+        steps = min(generated.shape[1], len(output.scores))
+        if steps == 0:
+            return [0.0] * output.sequences.shape[0]
 
         pad_id = self._model.config.pad_token_id
-        mask = torch.ones_like(token_probs, dtype=torch.bool)
-        if pad_id is not None:
-            mask = generated != pad_id
 
-        confidences: list[float] = []
-        for i in range(token_probs.shape[0]):
-            valid = token_probs[i][mask[i]]
-            confidences.append(
-                round(float(valid.mean()), 4) if valid.numel() else 0.0
+        totals = torch.zeros(generated.shape[0], dtype=torch.float32)
+        counts = torch.zeros(generated.shape[0], dtype=torch.float32)
+        for step in range(steps):
+            tokens = generated[:, step]
+            step_probs = torch.softmax(output.scores[step].float(), dim=-1)
+            token_probs = step_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+            keep = (
+                torch.ones_like(token_probs, dtype=torch.bool)
+                if pad_id is None
+                else tokens != pad_id
             )
-        return confidences
+            totals += torch.where(keep, token_probs, torch.zeros_like(token_probs))
+            counts += keep.to(totals.dtype)
+
+        return [
+            round(float(total / count), 4) if count else 0.0
+            for total, count in zip(totals.tolist(), counts.tolist())
+        ]
